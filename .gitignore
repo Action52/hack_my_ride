@@ -6,6 +6,7 @@ __pycache__/
 # C extensions
 *.so
 ./.DS_store
+.DS_Strore
 
 # Distribution / packaging
 .Python
@@ -128,3 +129,5 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+.ipynb_checkpoints/*
