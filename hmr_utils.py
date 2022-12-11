@@ -8,7 +8,15 @@ import numpy as np
 from datetime import datetime
 import datetime as dt
 import math
-from typing import Optional
+import matplotlib
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm_notebook
+from tqdm import tqdm
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, precision_score, recall_score, accuracy_score, f1_score
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed, Future, wait
+
+warnings.filterwarnings('ignore')
 
 
 def retrieve_route_data_at_stops_from_csv(route_short_name: int, input_file: str, distance_from_point: int = 5.0,
@@ -41,7 +49,7 @@ def retrieve_route_data_at_stops_from_csv(route_short_name: int, input_file: str
     return vehicle_position.sort_values(by=['stop_id', 'timestamp','distancefromPoint'])
 
 
-def get_route_id_from_route_short_name(route_short_name: str, routes_df: pd.DataFrame) -> Optional[str, None]:
+def get_route_id_from_route_short_name(route_short_name: str, routes_df: pd.DataFrame):
     """
     Since the gtfs data gives a different id to the route name, this method matches the id given a short name.
     Returns the first occurence or None if not found
@@ -56,7 +64,7 @@ def get_route_id_from_route_short_name(route_short_name: str, routes_df: pd.Data
     return None
 
 
-def get_route_name_from_route_id(route_id: str, routes_df: pd.DataFrame) -> Optional[None,str]:
+def get_route_name_from_route_id(route_id: str, routes_df: pd.DataFrame):
     """
     Retrieves the route name given a route id. Returns the first occurence or None if not found
     For example: '65' maps to '71'
@@ -82,7 +90,7 @@ def get_stop_origin_end_from_route_id(route_id: str, routes_df: pd.DataFrame) ->
     return origin, end
 
 
-def get_stop_ids_from_route_id(route_id: str, feed: gk.feed.Feed) -> set:
+def get_stop_ids_from_route_id(route_id: str, feed: gk.feed.Feed, direction_id) -> set:
     """
     Retrieves the stop ids associated to a particular route by searching over the programmed trips in gtfs.
     :param route_id: Route id.
@@ -90,8 +98,11 @@ def get_stop_ids_from_route_id(route_id: str, feed: gk.feed.Feed) -> set:
     :return:
     """
     stop_ids = feed.stop_times.merge(
-        feed.trips.filter(["trip_id", "route_id"])
-    ).loc[lambda x: x.route_id.isin([route_id]), "stop_id"].unique()
+        feed.trips.filter(["trip_id", "route_id", "direction_id"])
+    )
+    stop_ids = stop_ids.loc[
+        (stop_ids.route_id == route_id) & (stop_ids.direction_id==direction_id)
+    ]['stop_id'].unique()
     return set(stop_ids)
 
 
@@ -172,9 +183,8 @@ def get_average_headway(headway_df: pd.DataFrame) -> dt.timedelta:
     return headway_df.headway.mean().total_seconds()
 
 
-def get_awt(headway_df, stop_id=None, as_str=False) -> Optional[str, dt.timedelta]:
+def get_awt(headway_df, stop_id=None, as_str=False):
     """
-
     :param headway_df: Dataframe with headways
     :param stop_id: Stop id.
     :param as_str: returns the given timedelta as string (useful in case you want to print the output)
@@ -210,3 +220,180 @@ def get_line_headways_by_stop(line_id: str, feed: gk.Feed, df_path: str) -> pd.D
         except Exception as e:
             print(e)
     return pd.concat(headways_by_stop)
+
+
+def pick_trips_from_route(feed: gk.Feed, route_id='65') -> pd.DataFrame:
+    trips = feed.trips.loc[feed.trips.route_id == route_id].merge(
+        feed.calendar[['service_id', 'start_date', 'end_date']]).merge(feed.stop_times).merge(
+        feed.stops[['stop_id', 'stop_name']])
+    trips.drop(columns=['trip_headsign'], inplace=True, headway_split_time=660.0)
+    return trips
+
+
+def retrieve_headways_from_route_at_stop(feed, route_id='65', stop_id='3558', dates: list = ['20210903'],
+                                         start_hour='05:00:00', end_hour='23:00:00', moving_average_period=5,
+                                         return_by_periods=False, group_by_period='1H', headway_split_time=720.0,
+                                         direction_id=0
+                                         ) -> pd.DataFrame:
+    # For the example let's pick the ones associated to the Stop Cimetiere D'Ixelles
+    route_timetable = gk.routes.build_route_timetable(feed, route_id=route_id, dates=dates)
+    route_timetable = route_timetable.loc[
+        (route_timetable.stop_id == stop_id) & (route_timetable.direction_id == direction_id)].merge(
+        feed.calendar).sort_values(by='arrival_time')
+    # Now calculate headway
+    route_timetable['headway'] = (pd.to_datetime(route_timetable['departure_time'], errors='coerce') - (
+        pd.to_datetime(route_timetable['departure_time'], errors='coerce').shift(1))).dt.total_seconds()
+    route_timetable = route_timetable.loc[
+        (route_timetable['departure_time'] >= start_hour) & (route_timetable['departure_time'] < end_hour)]
+    route_timetable['mvavg'] = route_timetable['headway'].rolling(moving_average_period).mean()
+    route_timetable['qas_indi_pred'] = None
+    route_timetable['qas_indi_real'] = None
+    route_timetable.loc[route_timetable['headway'] < headway_split_time, 'qas_indi_real'] = 'REGULARITY'
+    route_timetable.loc[route_timetable['headway'] >= headway_split_time, 'qas_indi_real'] = 'PUNCTUALITY'
+    route_timetable.loc[route_timetable['mvavg'] < headway_split_time, 'qas_indi_pred'] = 'REGULARITY'
+    route_timetable.loc[route_timetable['mvavg'] >= headway_split_time, 'qas_indi_pred'] = 'PUNCTUALITY'
+    route_timetable = route_timetable.set_index('departure_time', drop=False)
+    route_timetable.index = pd.to_datetime(route_timetable.index)
+    if return_by_periods:
+        periods = []
+        route_timetables_per_period = route_timetable.groupby(pd.Grouper(freq=group_by_period))  # .mean()
+        for idx, route_timetable_per_period in route_timetables_per_period:
+            route_timetable_per_period['period'] = idx
+            periods.append(route_timetable_per_period)
+        # route_timetable_per_period['qas_indi_pred'] = None
+        # route_timetable_per_period['qas_indi_real'] = None
+        # route_timetable_per_period.loc[route_timetable_per_period['headway'] < headway_split_time, 'qas_indi_real'] = 'REGULARITY'
+        # route_timetable_per_period.loc[route_timetable_per_period['headway'] >= headway_split_time, 'qas_indi_real'] = 'PUNCTUALITY'
+        # route_timetable_per_period.loc[route_timetable_per_period['mvavg'] < headway_split_time, 'qas_indi_pred'] = 'REGULARITY'
+        # route_timetable_per_period.loc[route_timetable_per_period['mvavg'] >= headway_split_time, 'qas_indi_pred'] = 'PUNCTUALITY'
+        # route_timetable_per_period.dropna(inplace=True)
+        return pd.concat(periods)
+    route_timetable.dropna(inplace=True)
+    return route_timetable
+
+
+def retrieve_average_time_periods_from_route(route_timetable_overall, group_by_period='30Min',
+                                             headway_split_time=660.0):
+    route_timetable_per_period = route_timetable_overall.groupby(pd.Grouper(freq=group_by_period)).mean()
+    route_timetable_per_period['qas_indi_pred'] = None
+    route_timetable_per_period['qas_indi_real'] = None
+    route_timetable_per_period.loc[
+        route_timetable_per_period['headway'] < headway_split_time, 'qas_indi_real'] = 'REGULARITY'
+    route_timetable_per_period.loc[
+        route_timetable_per_period['headway'] >= headway_split_time, 'qas_indi_real'] = 'PUNCTUALITY'
+    route_timetable_per_period.loc[
+        route_timetable_per_period['mvavg'] < headway_split_time, 'qas_indi_pred'] = 'REGULARITY'
+    route_timetable_per_period.loc[
+        route_timetable_per_period['mvavg'] >= headway_split_time, 'qas_indi_pred'] = 'PUNCTUALITY'
+    route_timetable_per_period.dropna(inplace=True)
+    return route_timetable_per_period
+
+
+def compute_metrics_qas(route_timetable_at_stop):
+    precision = precision_score(route_timetable_at_stop['qas_indi_real'], route_timetable_at_stop['qas_indi_pred'],
+                                pos_label='REGULARITY')
+    recall = recall_score(route_timetable_at_stop['qas_indi_real'], route_timetable_at_stop['qas_indi_pred'],
+                          pos_label='REGULARITY')
+    accuracy = accuracy_score(route_timetable_at_stop['qas_indi_real'], route_timetable_at_stop['qas_indi_pred'])
+    f1 = f1_score(route_timetable_at_stop['qas_indi_real'], route_timetable_at_stop['qas_indi_pred'],
+                  pos_label='REGULARITY')
+    return {'precision': precision, 'recall': recall, 'accuracy': accuracy, 'f1_score': f1}
+
+
+def plot_headways_from_route_at_stop(route_timetable_at_stop, bars='qas_indi_real'):
+    plt.subplots(figsize=(20, 6))
+    plt.xticks(rotation=90)
+    ax = sns.barplot(x=route_timetable_at_stop.index, y='headway', data=route_timetable_at_stop, hue=bars,
+                     palette={'PUNCTUALITY': 'r', 'REGULARITY': 'b'}, alpha=0.6)
+    ax2 = ax.twinx()
+    ax2.plot(ax.get_xticks(), route_timetable_at_stop['mvavg'], color='black')
+    plt.plot()
+
+
+def plot_average_timetable_for_route(route_timetable_per_period, bars='qas_indi_real'):
+    plt.subplots(figsize=(20, 6))
+    plt.xticks(rotation=90)
+    ax = sns.barplot(x=route_timetable_per_period.index, y='headway', data=route_timetable_per_period, hue=bars,
+                     palette={'PUNCTUALITY': 'r', 'REGULARITY': 'b'}, alpha=0.6)
+    ax2 = ax.twinx()
+    ax2.plot(ax.get_xticks(), route_timetable_per_period['mvavg'], color='black')
+    plt.plot()
+
+
+def plot_confussion_matrix_predicted_qas_metric(route_timetable_at_stop):
+    cm = confusion_matrix(route_timetable_at_stop['qas_indi_real'], route_timetable_at_stop['qas_indi_pred'])
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    disp.plot()
+    plt.show()
+
+
+def retrieve_headways_from_route(feed, route_id='65', dates: list = ['20210823'],
+                                 start_hour='02:00:00', end_hour='23:00:00',
+                                 moving_average_period=5,
+                                 return_by_periods=False, group_by_period='30Min', headway_split_time=660.0,
+                                 direction_id=0, show_tqdm=False) -> pd.DataFrame:
+    stop_ids = get_stop_ids_from_route_id(route_id, feed, direction_id)
+    headways_from_route = []
+    results = []
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = []
+        for stop_id in stop_ids:
+            future = executor.submit(
+                retrieve_headways_from_route_at_stop, feed, route_id, stop_id,
+                dates, start_hour, end_hour, moving_average_period, return_by_periods,
+                group_by_period, headway_split_time
+            )
+            futures.append(future)
+        if not show_tqdm:
+            for future in as_completed(futures):
+                result = future.result()
+                results.append(result)
+        else:
+            bar = tqdm(total=len(stop_ids))
+            for future in as_completed(futures):
+                result = future.result()
+                results.append(result)
+                bar.update(1)
+            bar.close()
+    return pd.concat(results)
+
+
+def tag_routes(feed: gk.feed, route_short_names: list = None, dates=['20210903'],
+               start_hour='02:00:00', end_hour='23:59:00', moving_average_period=5,
+               return_by_periods=True, group_by_period='30Min', headway_split_time=660.0, write_folder=""):
+    if route_short_names is None:
+        route_ids = [get_route_id_from_route_short_name(route_short_name, feed.routes)
+                     for route_short_name in feed.routes.route_short_name.unique()]
+    else:
+        route_ids = [get_route_id_from_route_short_name(route_short_name, feed.routes)
+                     for route_short_name in route_short_names]
+    results = []
+    with ProcessPoolExecutor(max_workers=4) as executor:
+        futures = []
+        for date in dates:
+            for route_id in route_ids:
+                for direction_id in [0, 1]:
+                    futures.append(executor.submit(
+                        retrieve_headways_from_route, feed, route_id, [date], start_hour, end_hour,
+                        moving_average_period, return_by_periods, group_by_period,
+                        headway_split_time, direction_id, False
+                    ))
+        for future in tqdm(as_completed(futures), total=len(dates)*len(route_ids)*2):
+            result = future.result()
+            result.to_parquet(f'{write_folder}tagged_{date}_{route_id}', engine='fastparquet', compression='gzip', index=True,
+                              partition_cols=['date', 'direction_id', 'stop_id'])
+
+
+def main():
+    data_folder = '/Users/alfredo.leon/Desktop/DataMiningProject/Project Data-20221021/'
+    path = Path(data_folder + "gtfs3Sept.zip")
+    feed = (gk.read_feed(path, dist_units='km'))
+    feed.validate()
+    tagged_folder = '/Users/alfredo.leon/Desktop/DataMiningProject/tagged/'
+
+    tag_routes(feed, route_short_names=['71', '95', '34', '57'],
+               dates=['20210908', '20210915', '20210910', '20210917', '20210911', '20211118'], write_folder=tagged_folder)
+
+
+if __name__ == '__main__':
+    main()
