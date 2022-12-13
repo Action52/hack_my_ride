@@ -1,3 +1,5 @@
+import os.path
+
 import pandas as pd
 import geopandas as gpd
 import json
@@ -13,6 +15,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm_notebook
 from tqdm import tqdm
+import logging
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, precision_score, recall_score, accuracy_score, f1_score
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed, Future, wait
 
@@ -243,7 +246,7 @@ def retrieve_headways_from_route_at_stop(feed, route_id='65', stop_id='3558', da
     # Now calculate headway
     route_timetable['headway'] = (pd.to_datetime(route_timetable['departure_time'], errors='coerce') - (
         pd.to_datetime(route_timetable['departure_time'], errors='coerce').shift(1))).dt.total_seconds()
-    route_timetable = route_timetable.loc[
+    route_timetable: pd.DataFrame = route_timetable.loc[
         (route_timetable['departure_time'] >= start_hour) & (route_timetable['departure_time'] < end_hour)]
     route_timetable['mvavg'] = route_timetable['headway'].rolling(moving_average_period).mean()
     route_timetable['qas_indi_pred'] = None
@@ -253,6 +256,7 @@ def retrieve_headways_from_route_at_stop(feed, route_id='65', stop_id='3558', da
     route_timetable.loc[route_timetable['mvavg'] < headway_split_time, 'qas_indi_pred'] = 'REGULARITY'
     route_timetable.loc[route_timetable['mvavg'] >= headway_split_time, 'qas_indi_pred'] = 'PUNCTUALITY'
     route_timetable = route_timetable.set_index('departure_time', drop=False)
+    route_timetable.rename(columns={'departure_time': 'departure_time_col'}, inplace=True)
     route_timetable.index = pd.to_datetime(route_timetable.index)
     if return_by_periods:
         periods = []
@@ -267,7 +271,11 @@ def retrieve_headways_from_route_at_stop(feed, route_id='65', stop_id='3558', da
         # route_timetable_per_period.loc[route_timetable_per_period['mvavg'] < headway_split_time, 'qas_indi_pred'] = 'REGULARITY'
         # route_timetable_per_period.loc[route_timetable_per_period['mvavg'] >= headway_split_time, 'qas_indi_pred'] = 'PUNCTUALITY'
         # route_timetable_per_period.dropna(inplace=True)
-        return pd.concat(periods)
+        if not all(period is None for period in periods):
+            return pd.concat(periods)
+        else:
+            logging.debug(f"{route_id}, {stop_id}, {periods} no results.")
+            return None
     route_timetable.dropna(inplace=True)
     return route_timetable
 
@@ -285,6 +293,9 @@ def retrieve_average_time_periods_from_route(route_timetable_overall, group_by_p
         route_timetable_per_period['mvavg'] < headway_split_time, 'qas_indi_pred'] = 'REGULARITY'
     route_timetable_per_period.loc[
         route_timetable_per_period['mvavg'] >= headway_split_time, 'qas_indi_pred'] = 'PUNCTUALITY'
+    if 'qas_rm_forest' in route_timetable_overall.columns:
+        route_timetable_per_period['qas_rm_forest_pred'] = route_timetable_overall.groupby(
+            pd.Grouper(freq=group_by_period))['qas_rm_forest'].agg(pd.Series.mode)
     route_timetable_per_period.dropna(inplace=True)
     return route_timetable_per_period
 
@@ -335,15 +346,13 @@ def retrieve_headways_from_route(feed, route_id='65', dates: list = ['20210823']
     stop_ids = get_stop_ids_from_route_id(route_id, feed, direction_id)
     headways_from_route = []
     results = []
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = []
-        for stop_id in stop_ids:
-            future = executor.submit(
+    with ProcessPoolExecutor(max_workers=8) as executor:
+        futures = [
+            executor.submit(
                 retrieve_headways_from_route_at_stop, feed, route_id, stop_id,
                 dates, start_hour, end_hour, moving_average_period, return_by_periods,
-                group_by_period, headway_split_time
-            )
-            futures.append(future)
+                group_by_period, headway_split_time, direction_id)
+            for stop_id in stop_ids]
         if not show_tqdm:
             for future in as_completed(futures):
                 result = future.result()
@@ -355,12 +364,17 @@ def retrieve_headways_from_route(feed, route_id='65', dates: list = ['20210823']
                 results.append(result)
                 bar.update(1)
             bar.close()
-    return pd.concat(results)
+    if not all(result is None for result in results):
+        return pd.concat(results)
+    else:
+        logging.debug("All headways from route were None. Skipping.")
+        return None
 
 
 def tag_routes(feed: gk.feed, route_short_names: list = None, dates=['20210903'],
                start_hour='02:00:00', end_hour='23:59:00', moving_average_period=5,
-               return_by_periods=True, group_by_period='30Min', headway_split_time=660.0, write_folder=""):
+               return_by_periods=True, group_by_period='30Min', headway_split_time=660.0, write_folder="",
+               multiprocess=False):
     if route_short_names is None:
         route_ids = [get_route_id_from_route_short_name(route_short_name, feed.routes)
                      for route_short_name in feed.routes.route_short_name.unique()]
@@ -368,31 +382,63 @@ def tag_routes(feed: gk.feed, route_short_names: list = None, dates=['20210903']
         route_ids = [get_route_id_from_route_short_name(route_short_name, feed.routes)
                      for route_short_name in route_short_names]
     results = []
-    with ProcessPoolExecutor(max_workers=4) as executor:
-        futures = []
+    if multiprocess:
+        with ProcessPoolExecutor(max_workers=8) as executor:
+            futures = []
+            for date in dates:
+                for route_id in route_ids:
+                    for direction_id in [0, 1]:
+                        futures.append(executor.submit(
+                            retrieve_headways_from_route, feed, route_id, [date], start_hour, end_hour,
+                            moving_average_period, return_by_periods, group_by_period,
+                            headway_split_time, direction_id, False
+                        ))
+            for future in tqdm(as_completed(futures), total=len(dates)*len(route_ids)*2):
+                result = future.result()
+                result.to_parquet(f'{write_folder}tagged_{date}_{route_id}', engine='fastparquet', compression='gzip', index=True,
+                                  partition_cols=['date', 'direction_id', 'stop_id'])
+    else:
+        bar = tqdm(total=(len(dates)*len(route_ids)*2))
         for date in dates:
             for route_id in route_ids:
                 for direction_id in [0, 1]:
-                    futures.append(executor.submit(
-                        retrieve_headways_from_route, feed, route_id, [date], start_hour, end_hour,
-                        moving_average_period, return_by_periods, group_by_period,
-                        headway_split_time, direction_id, False
-                    ))
-        for future in tqdm(as_completed(futures), total=len(dates)*len(route_ids)*2):
-            result = future.result()
-            result.to_parquet(f'{write_folder}tagged_{date}_{route_id}', engine='fastparquet', compression='gzip', index=True,
-                              partition_cols=['date', 'direction_id', 'stop_id'])
+                    try:
+                        result = retrieve_headways_from_route(
+                            feed, route_id, [date], start_hour, end_hour,
+                            moving_average_period, return_by_periods, group_by_period,
+                            headway_split_time, direction_id, False
+                        )
+                        if result is not None:
+                            name = f'{write_folder}tagged_{date}_{route_id}_{direction_id}'
+                            if not os.path.isfile(name):
+                                result.to_parquet(name, engine='fastparquet',
+                                                  compression='gzip', index=True,
+                                                  partition_cols=['date', 'direction_id', 'stop_id'])
+                            else:
+                                result.to_parquet(name, engine='fastparquet',
+                                                  compression='gzip', index=True,
+                                                  partition_cols=['date', 'direction_id', 'stop_id'], append=True)
+                            print(f"Finished processing {route_id}, {date}, {direction_id}")
+                        else:
+                            logging.debug(f"{route_id}, {date}, {direction_id} returned a null dataframe for all stops.")
+                    except Exception as e:
+                        logging.debug(f"Error processing {route_id}, {date}, {direction_id}")
+                        logging.debug(e)
+                    bar.update(1)
+        bar.close()
 
 
 def main():
+    logging.basicConfig(level=logging.DEBUG, filename="logging.log")
     data_folder = '/Users/alfredo.leon/Desktop/DataMiningProject/Project Data-20221021/'
     path = Path(data_folder + "gtfs3Sept.zip")
     feed = (gk.read_feed(path, dist_units='km'))
     feed.validate()
-    tagged_folder = '/Users/alfredo.leon/Desktop/DataMiningProject/tagged/'
-
+    tagged_folder = '/Users/alfredo.leon/Desktop/DataMiningProject/tagged_correct/'
+    dates = ['20210908', '20210915', '20210911', '20210918']
     tag_routes(feed, route_short_names=['71', '95', '34', '57'],
-               dates=['20210908', '20210915', '20210910', '20210917', '20210911', '20211118'], write_folder=tagged_folder)
+               dates=dates,
+               write_folder=tagged_folder)
 
 
 if __name__ == '__main__':

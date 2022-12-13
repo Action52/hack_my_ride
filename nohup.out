@@ -1,3 +1,3 @@
-  0%|          | 0/26 [00:00<?, ?it/s]  0%|          | 0/22 [00:00<?, ?it/s]  0%|          | 0/31 [00:00<?, ?it/s]  0%|          | 0/33 [00:00<?, ?it/s]  3%|▎         | 1/31 [02:03<1:01:57, 123.92s/it]  0%|          | 0/22 [07:36<?, ?it/s]
-  0%|          | 0/28 [00:00<?, ?it/s]  4%|▎         | 1/28 [01:32<41:38, 92.54s/it]/usr/local/Caskroom/miniconda/base/envs/hmr/lib/python3.9/multiprocessing/resource_tracker.py:216: UserWarning: resource_tracker: There appear to be 9 leaked semaphore objects to clean up at shutdown
+  0%|          | 0/48 [00:00<?, ?it/s]  0%|          | 0/48 [06:36<?, ?it/s]
+/usr/local/Caskroom/miniconda/base/envs/hmr/lib/python3.9/multiprocessing/resource_tracker.py:216: UserWarning: resource_tracker: There appear to be 6 leaked semaphore objects to clean up at shutdown
   warnings.warn('resource_tracker: There appear to be %d '
