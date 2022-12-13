@@ -295,7 +295,7 @@ def retrieve_average_time_periods_from_route(route_timetable_overall, group_by_p
         route_timetable_per_period['mvavg'] >= headway_split_time, 'qas_indi_pred'] = 'PUNCTUALITY'
     if 'qas_rm_forest' in route_timetable_overall.columns:
         route_timetable_per_period['qas_rm_forest_pred'] = route_timetable_overall.groupby(
-            pd.Grouper(freq=group_by_period))['qas_rm_forest'].agg(pd.Series.mode)
+            pd.Grouper(freq=group_by_period))['qas_rm_forest'].apply(lambda x: x.mode().iloc[0])
     route_timetable_per_period.dropna(inplace=True)
     return route_timetable_per_period
 
