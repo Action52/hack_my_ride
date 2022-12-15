@@ -35,8 +35,8 @@ def retrieve_route_data_at_stops_from_csv(route_short_name: int, input_file: str
     """
     stops = feed.stops.copy(deep=True)
     stops['stop_id'] = stops['stop_id'].astype(str)
-    dtypes = {'timestamp': str, 'lineID': np.int64, 'directionID':np.int64, 'pointID': np.int64,
-              'distancefromPoint': np.float64, 'time': str, 'year':int, 'month':int, 'day':int, 'hour':int, 'minute':int, 'second':int}
+    dtypes = {'timestamp': str, 'lineID': np.int64, 'directionID': np.int64, 'pointID': np.int64,
+              'distancefromPoint': np.float64, 'time': str, 'year': int, 'month':int, 'day':int, 'hour':int, 'minute':int, 'second':int}
     vehicle_position = pd.read_csv(input_file)
     vehicle_position.dropna(inplace=True)
     for col, dtype in dtypes.items():
@@ -163,16 +163,23 @@ def vehicle_position_by_date(vehicle_position_df: pd.DataFrame, from_date: datet
     return vehicle_position_dates_df
 
 
-def get_real_headway_by_stop(real_df: pd.DataFrame, stop_id) -> pd.DataFrame:
+def get_real_headway_by_stop(real_df: pd.DataFrame, route_id=None, stop_id=None) -> pd.DataFrame:
     """
     Calculates the real headway given a dataframe of real data on a particular stop associated to a route_id.
     :param real_df: Dataframe of real data associated to a particular route.
     :param stop_id: Stop id
+    :param route_id: Route id
     :return:
     """
-    vehicles_at_stop = real_df.loc[
-        real_df['stop_id'] == stop_id
-        ]
+    if route_id is None:
+        vehicles_at_stop = real_df.loc[
+            real_df['stop_id'] == stop_id
+            ]
+    else:
+        vehicles_at_stop = real_df.loc[
+            (real_df['lineID'] == route_id) &
+            (real_df['stop_id'] == stop_id)
+            ]
     vehicles_at_stop['headway'] = vehicles_at_stop['time'] - vehicles_at_stop['time'].shift(1)
     return vehicles_at_stop
 
@@ -202,7 +209,7 @@ def get_awt(headway_df, stop_id=None, as_str=False):
     return awt
 
 
-def get_line_headways_by_stop(line_id: str, feed: gk.Feed, df_path: str) -> pd.DataFrame:
+def get_line_headways_by_stop(line_id: str, feed: gk.Feed, df_path: str = None, line_df=None) -> pd.DataFrame:
     """
     Returns the line headways by stop.
     :param line_id: Line id of the route. For example '65' for line 71.
@@ -213,7 +220,13 @@ def get_line_headways_by_stop(line_id: str, feed: gk.Feed, df_path: str) -> pd.D
     """
     stops = get_stop_ids_from_route_id(route_id=line_id, feed=feed)
     route_short_name = get_route_name_from_route_id(line_id, feed.routes)
-    line_df = retrieve_route_data_at_stops_from_csv(int(route_short_name), df_path, distance_from_point=5.0, feed=feed)
+    if df_path is not None:
+        line_df = retrieve_route_data_at_stops_from_csv(
+            route_short_name=int(route_short_name),
+            input_file=df_path,
+            distance_from_point=5,
+            feed=feed
+        )
     headways_by_stop = []
     for stop in stops:
         try:
