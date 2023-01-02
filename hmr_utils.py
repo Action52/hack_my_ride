@@ -18,6 +18,10 @@ from tqdm import tqdm
 import logging
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, precision_score, recall_score, accuracy_score, f1_score
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed, Future, wait
+#libaries for frequent set detection
+from mlxtend.preprocessing import TransactionEncoder
+from mlxtend.frequent_patterns import apriori, association_rules
+from mlxtend.frequent_patterns import apriori
 
 warnings.filterwarnings('ignore')
 
@@ -440,6 +444,28 @@ def tag_routes(feed: gk.feed, route_short_names: list = None, dates=['20210903']
                     bar.update(1)
         bar.close()
 
+def getBottleneckSets(testset, n=5):
+    """
+    Gets from incoming stop list, the stops where the delay was bigger than n
+    """
+    testset['prev'] = testset['stop_name'].shift(1)
+    testset['prev_delay'] = testset['delay'].shift(1)
+    testset['dif'] = testset['delay'] - testset['prev_delay'] 
+    
+    subsets=testset.loc[(testset.dif >= 5)][['stop_name', 'prev']] #filter stops with >5 difference in delay
+    sets=subsets.values.tolist() #Parse from dataframe to list
+    return sets
+  
+  def getFrequentSets(dataset, min_support=0.1):
+    """
+    Gets from list of sets, the most frequent
+    """
+    tr = TransactionEncoder()
+    tr_arr = tr.fit(dataset).transform(dataset)
+    df = pd.DataFrame(tr_arr, columns=tr.columns_)
+
+    frequent_itemsets = apriori(df, min_support, use_colnames = True)
+    return frequent_itemsets
 
 def main():
     logging.basicConfig(level=logging.DEBUG, filename="logging.log")
